@@ -1,1 +1,1 @@
-Foundations of Graphical Models Final Project
+# Foundations of Graphical Models Final Project
