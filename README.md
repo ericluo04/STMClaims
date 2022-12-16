@@ -1,2 +1,2 @@
-# STM/Topic Modeling w/Retirement Claims
+# STM/Topic Modeling with Retirement Claims
 Foundations of Graphical Models Final Project
