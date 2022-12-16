@@ -1,0 +1,214 @@
+---
+title: "CTM/LDA + Knoll. et al. (2015)"
+author: "Lan Luo"
+date: "December 12, 2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Initialize Environment
+```{r}
+# clear environment
+rm(list=ls())
+# turn off scientific notation
+options(scipen=999)
+# free up RAM
+gc()
+
+# set base path
+base_path <- "G:/My Drive/Columbia Files/"
+path <- paste0(base_path, "Coursework/2022-2023 Fall/Graphical Models/Project/")
+```
+# Load Packages
+```{r}
+# load packages
+packages <- c("dplyr", "tidyverse", "tidyr", "tidytext", "corrplot", "corrr", "kableExtra", "stm", "igraph", "wordcloud", "tm", "huge", "quanteda", "magrittr", "rstan", "bayesplot", "parallel")
+sapply(packages, require, character.only=T)
+
+# custom functions
+source(paste0(base_path, "Research/- helper/lan_Rhelper.R"))
+```
+
+# Initialize Data
+```{r}
+# import data
+data <- read.csv(paste0(path, "Data/claims_long.csv"), 
+                 colClasses=c(treatment='factor', ID='factor', female='factor',
+                              coliving='factor', smoker='factor', politics='factor', 
+                              benefit_eligible='factor', ethnicity='factor'))
+```
+
+```{r}
+# drop savings col (too many missing values and already have income)
+data <- subset(data, select = -c(savings))
+# empty string as missing
+data[data==""] <- NA
+# filter missing
+data <- na.omit(data)
+```
+
+```{r}
+# add col w/n-grams (uni and bigrams)
+toks <- tokens_ngrams(tokens(data$thought_clean), n=1:2)
+data$thought_clean2 <- sapply(toks, function(x) paste(as.character(x), collapse = " "))
+```
+
+# Text Processing
+```{r}
+# process text
+proc <- textProcessor(data$thought_clean2, metadata=data,
+                      lowercase = F, removestopwords = F, removenumbers = F,
+                      removepunctuation = F, stem = F, wordLengths = c(1, Inf),
+                      language = "en")
+# prepare documents 
+out <- prepDocuments(proc$documents, proc$vocab, proc$meta, 
+                     lower.thresh = 9) # removes words not in > N docs
+
+# output
+docs <- out$documents
+vocab <- out$vocab
+meta <- out$meta
+```
+
+```{r}
+# make document-term matrix version
+## from https://stackoverflow.com/questions/72141579/convert-processed-format-with-stm-into-dtm-structural-topic-modeling
+dtm <- tibble(out_doc = docs %>% map(t)) %>%
+  mutate(out_doc = out_doc %>% map(set_colnames, c("term", "n"))) %>% 
+  mutate(out_doc = out_doc %>% map(as_tibble)) %>% 
+  rownames_to_column(var = "document") %>% 
+  unnest(cols = out_doc) %>% 
+  mutate(term = vocab[term]) %>% 
+  cast_dtm(document, term, n)
+
+# train-test split (85-15)
+set.seed(42)
+train_samp <- sample(length(unique(dtm$i)), floor(length(unique(dtm$i))*.85), replace=F)
+train_dtm <- dtm[dtm$dimnames$Docs %in% train_samp,]
+test_dtm <- dtm[!(dtm$dimnames$Docs %in% train_samp),]
+
+# data for stan
+## from http://ccgilroy.com/csss564-labs-2019/09-review-mixtures/09-review-mixtures.html#appendix
+make_stan <- function(dtm) {
+  # renumber doc IDs consecutively for train/test
+  dtm$dimnames$Docs <- 1:length(dtm$dimnames$Docs)
+  
+  dtm %>%
+    tidy() %>%
+    mutate(ids = map(count, seq_len)) %>% 
+    unnest(cols=c(ids)) %>%
+    mutate(w = as.integer(as_factor(term))) %>%
+    select(-ids, -count) %>%
+    mutate_at(c('document'), as.integer) %>%
+    arrange(document, term)
+}
+train_stan <- make_stan(train_dtm)
+test_stan <- make_stan(test_dtm)
+```
+
+```{r}
+# prepare list for stan
+## training
+d <- list(
+  doc = train_stan$document,
+  w = train_stan$w
+)
+d$K <- 5
+d$V <- 220
+d$M <- length(unique(d$doc))
+d$N <- length(d$w)
+d$alpha <- rep(50/d$K, d$K)
+d$beta <- rep(.01, d$V)
+
+## testing
+d_test <- list(
+  doc = test_stan$document,
+  w = test_stan$w
+)
+d_test$K <- 5
+d_test$V <- 220
+d_test$M <- length(unique(d_test$doc))
+d_test$N <- length(d_test$w)
+d_test$alpha <- rep(50/d$K, d_test$K)
+d_test$beta <- rep(.01, d_test$V) 
+```
+
+
+# LDA
+```{r}
+# load lda stan model
+stan_lda <- stan_model("lda.stan")
+```
+## HMC
+```{r}
+# HMC
+t0 <- Sys.time()
+lda_hmc <- sampling(stan_lda, data=d, algorithm="NUTS",
+                warmup=500, iter=1000, chains=3, seed=123,
+                cores=detectCores()-1)
+t1 <- Sys.time()
+print(paste0("HMC Time: ", t1-t0))
+
+## heldout generic (expected) log-predictive density
+gen_test_hmc <- gqs(stan_lda, draws=as.matrix(lda_hmc), data=d_test)
+log_pd <- loo::extract_log_lik(gen_test_hmc)
+(elpd_holdout <- loo::elpd(log_pd))
+```
+## Mean-Field ADVI (not feasible b/c of nonconjugacy)
+```{r}
+# mean-field VI
+t0 <- Sys.time()
+lda_vi_mean <- rstan::vb(stan_lda, data=d, algorithm="meanfield",
+                         output_samples=1000, tol_rel_obj=.3, seed=42)
+t1 <- Sys.time()
+print(paste0("Mean-Field ADVI Time: ", t1-t0))
+
+
+## heldout generic (expected) log-predictive density
+gen_test_vi <- rstan::gqs(stan_lda, draws=as.matrix(lda_vi_mean), data=d_test)
+log_pd <- loo::extract_log_lik(gen_test_vi)
+(elpd_holdout <- loo::elpd(log_pd))
+```
+
+
+# CTM
+```{r}
+# load ctm stan model
+stan_ctm <- stan_model("ctm.stan")
+stan_ctm_heldout <- stan_model("ctm_heldout.stan")
+```
+
+## HMC
+```{r}
+# HMC
+t0 <- Sys.time()
+ctm_hmc <- sampling(stan_ctm, data=d, algorithm="NUTS",
+                warmup=500, iter=1000, chains=3, seed=123,
+                cores=detectCores()-1)
+t1 <- Sys.time()
+print(paste0("HMC Time: ", t1-t0))
+
+## heldout generic (stan_ctm) log-predictive density
+gen_test_hmc <- gqs(stan_ctm_heldout, draws=as.matrix(ctm_hmc), data=d_test)
+log_pd <- loo::extract_log_lik(gen_test_hmc)
+(elpd_holdout <- loo::elpd(log_pd))
+```
+
+## Mean-Field ADVI (not feasible b/c of nonconjugacy)
+```{r}
+# mean-field VI
+t0 <- Sys.time()
+ctm_vi_mean <- rstan::vb(stan_ctm, data=d, algorithm="meanfield", init=0,
+                         output_samples=1000, tol_rel_obj=.3, iter=500, seed=42)
+t1 <- Sys.time()
+print(paste0("Mean-Field ADVI Time: ", t1-t0))
+
+
+## heldout generic (expected) log-predictive density
+gen_test_vi <- rstan::gqs(stan_ctm_heldout, draws=as.matrix(ctm_vi_mean), data=d_test)
+log_pd <- loo::extract_log_lik(gen_test_vi)
+(elpd_holdout <- loo::elpd(log_pd))
+```

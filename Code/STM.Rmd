@@ -1,0 +1,228 @@
+---
+title: "STM + Knoll. et al. (2015)"
+author: "Lan Luo"
+date: "December 12, 2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Initialize Environment
+```{r}
+# clear environment
+rm(list=ls())
+# turn off scientific notation
+options(scipen=999)
+# free up RAM
+gc()
+
+# set base path
+base_path <- "G:/My Drive/Columbia Files/"
+path <- paste0(base_path, "Coursework/2022-2023 Fall/Graphical Models/Project/")
+```
+# Load Packages
+```{r}
+# load packages
+packages <- c("dplyr", "tidyverse", "tidyr", "corrplot", "corrr", "kableExtra", "stm", "igraph", "wordcloud", "tm", "huge", "quanteda")
+sapply(packages, require, character.only=T)
+
+# custom functions
+source(paste0(base_path, "Research/- helper/lan_Rhelper.R"))
+```
+
+# Initialize Data
+```{r}
+# import data
+data <- read.csv(paste0(path, "Data/claims_long.csv"), 
+                 colClasses=c(treatment='factor', ID='factor', female='factor',
+                              coliving='factor', smoker='factor', politics='factor', 
+                              benefit_eligible='factor', ethnicity='factor'))
+```
+
+```{r}
+# list of factor vars
+fact_names <- colnames(data[, sapply(data, is.factor) & colnames(data) != "ID"])
+# list of numeric vars
+num_names <- colnames(data[, sapply(data, is.numeric)])
+
+# aggregate df (s.t. each row = participant rather than thought)
+df_pers <- aggregate(data[, c(fact_names, num_names)], by=list(data$ID), FUN=first)
+
+# summary statistics (aggregated by person)
+## factor 
+summary(df_pers[, fact_names])
+## continuous
+summary_num(df_pers, num_names)
+```
+
+```{r}
+# drop savings col (too many missing values and already have income)
+data <- subset(data, select = -c(savings))
+# empty string as missing
+data[data==""] <- NA
+# filter missing
+data <- na.omit(data)
+```
+
+```{r}
+# add col w/n-grams (uni and bigrams)
+toks <- tokens_ngrams(tokens(data$thought_clean), n=1:2)
+data$thought_clean2 <- sapply(toks, function(x) paste(as.character(x), collapse = " "))
+```
+
+# Structural Topic Modeling
+## Processing
+```{r}
+# process text
+proc <- textProcessor(data$thought_clean2, metadata=data,
+                      lowercase = F, removestopwords = F, removenumbers = F,
+                      removepunctuation = F, stem = F, wordLengths = c(1, Inf),
+                      language = "en")
+# prepare documents 
+out <- prepDocuments(proc$documents, proc$vocab, proc$meta, 
+                     lower.thresh = 9) # removes words not in > N docs
+
+# output
+docs <- out$documents
+vocab <- out$vocab
+meta <- out$meta
+```
+
+## Searching over num topics
+```{r}
+storage <- searchK(out$documents, out$vocab, data=out$meta, K=2:8, 
+                   init="Spectral", # init w/non-negative matrix factorization of word co-occurrence matrix
+                   prevalence =~ treatment + female + coliving + smoker + politics + benefit_eligible + ethnicity +
+                     thought_count + s(age) + kids + s(income) + s(education) + numeracy + 
+                     perc_health + life_expectancy,
+                   content =~ treatment,
+                   gamma.prior = "Pooled", # normal priors w/topic-level pooled variance w/half-cauchy(1,1) prior
+                   sigma.prior = 0, # strength of regularization towards diagonalized covariance matrix
+                   kappa.prior = "L1", # prior for content covariate coefficients
+                   N = floor(.1*length(out$documents)), # num docs partially held out
+                   proportion = .5, # proportion of docs held out
+                   max.em.its = 250, # max num EM iterations
+                   emtol = 1e-5, # convergence tolerance (change in approximate variational lower bound)
+                   verbose=F,
+                   reportevery = 25)
+```
+
+```{r}
+# diagnostic values by # of topics
+plot(storage)
+```
+
+## Main model (K=5)
+```{r}
+# in- and out-of-sample split
+heldout <- make.heldout(out$documents, out$vocab,
+                        N = floor(.1*length(out$documents)), # num docs partial ly held out
+                        proportion = .15) # proportion of docs held out
+```
+
+```{r}
+t0 <- Sys.time()
+main_mod <- stm(heldout$documents, heldout$vocab, data=out$meta, K=5, 
+                init="Spectral", # init w/non-negative matrix factorization of word co-occurrence matrix
+                prevalence =~ treatment + female + coliving + smoker + politics + benefit_eligible + ethnicity +
+                  thought_count + s(age) + kids + s(income) + s(education) + numeracy + 
+                  perc_health + life_expectancy,
+                content =~ treatment,
+                gamma.prior = "Pooled", # normal priors w/topic-level pooled variance w/half-cauchy(1,1) prior
+                sigma.prior = 0, # strength of regularization towards diagonalized covariance matrix
+                kappa.prior = "L1", # prior for content covariate coefficients
+                max.em.its = 250, # max num EM iterations
+                emtol = 1e-6, # convergence tolerance (change in approximate variational lower bound)
+                verbose=T,
+                reportevery = 10)
+t1 <- Sys.time()
+print(paste0("STM Time: ", t1-t0))
+```
+
+```{r}
+# benchmark CTM (STM w/o covariates)
+t0 <- Sys.time()
+main_ctm <- stm(heldout$documents, heldout$vocab, data=out$meta, K=5, 
+                init="Spectral", # init w/non-negative matrix factorization of word co-occurrence matrix
+                gamma.prior = "Pooled", # normal priors w/topic-level pooled variance w/half-cauchy(1,1) prior
+                sigma.prior = 0, # strength of regularization towards diagonalized covariance matrix
+                kappa.prior = "L1", # prior for content covariate coefficients
+                max.em.its = 250, # max num EM iterations
+                emtol = 1e-6, # convergence tolerance (change in approximate variational lower bound)
+                verbose=T,
+                reportevery = 10)
+t1 <- Sys.time()
+print(paste0("CTM Time: ", t1-t0))
+```
+
+
+```{r}
+# save data and main model
+save(heldout, file="data_stm2.data")
+save(main_mod, file="main_stm2.mod")
+```
+
+```{r}
+# plot convergence
+plot(main_mod$convergence$bound, type="l",
+     xlab = "EM Iteration", ylab="Approximate Variational Lower Bound", main="Convergence of Inference")
+```
+
+```{r}
+# evaluating held-out log-likelihood
+eval.heldout(main_mod, heldout$missing)$expected.heldout
+eval.heldout(main_ctm, heldout$missing)$expected.heldout
+```
+
+# Interpreting model
+```{r}
+# labelTopics(main_mod, n=10)
+sageLabels(main_mod, n=10)
+```
+
+```{r}
+# estimate impact of treatment on theta
+top_names <- c("money", "enjoy retirement", "social security", "maximize savings", "health")
+prep <- estimateEffect(1:5 ~ treatment + s(age) + s(income), main_mod, meta=out$meta, uncertainty="Global", nsims=50)
+plot(prep, covariate="treatment", topics=1:5,
+     model=main_mod, method="difference", 
+     cov.value1="1.0", cov.value2="0.0",
+     xlab="Control ... Treatment", xlim = c(-.1, .1),
+     labeltype="custom", custom.labels=top_names)
+plot(prep, covariate="age", topics=c(2,5),
+     model=main_mod, method="continuous", xlab="Age")
+plot(prep, covariate="income", topics=c(1,3),
+     model=main_mod, method="continuous", xlab="Income")
+```
+
+
+```{r}
+# extracting doc-topic proportions
+meta2 <- meta
+for (i in 1:5){
+  meta2[, paste0("topic", i)] <- main_mod$theta[, i]
+}
+# extract thought most related to topic 5
+meta2[sample(nrow(meta2), 1),]
+```
+
+
+```{r}
+# compute correlation matrix (of topics)
+corr <- topicCorr(main_mod)$cor
+## label topic names
+rownames(corr) <- top_names
+colnames(corr) <- top_names
+
+# visualize
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+corrplot(corr, method="color", type="upper",
+         col=col(200), addCoef.col="black", # corr values
+         tl.col="black", tl.srt=45) # axes labels
+## as network
+corr %>%
+  network_plot(min_cor=.05, colors=col(200), repel=T, curved=T)
+```
+
